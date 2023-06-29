@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # CrossPost
 #  Post Mastodon Posts to Twitter.
 #
@@ -18,12 +18,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 
+import threading
+
 from requests import get
 from tempfile import mkstemp
 from bs4 import BeautifulSoup
-from os import fdopen, remove
 from sys import exit, stderr, argv
 from json import loads, JSONDecodeError
+from os import fdopen, remove, kill, getpid
 from mastodon import Mastodon, StreamListener
 from tweepy import Client, OAuth1UserHandler, API
 from signal import sigwait, SIGINT, SIGKILL, SIGSTOP
@@ -128,7 +130,7 @@ class CrossPoster(StreamListener):
 
     def start(self):
         self.handle = self.mastodon.stream_user(
-            self, run_async=True, reconnect_async=True
+            self, run_async=True, reconnect_async=False
         )
 
     def on_update(self, x):
@@ -189,6 +191,11 @@ def _get_media(media):
                 f.write(x.content)
         r.append(n)
     return r
+
+
+def _except_hook(_args):
+    print("Thread indicated a failure, signaling closure..")
+    kill(getpid(), SIGINT)
 
 
 def _parse_and_load(config):
@@ -252,6 +259,7 @@ if __name__ == "__main__":
     if len(c["accounts"]) == 0:
         print(f'No accounts found in "{argv[1]}"!', file=stderr)
         exit(1)
+    threading.excepthook = _except_hook
     e = list()
     for a in c["accounts"]:
         try:
