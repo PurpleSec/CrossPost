@@ -1,12 +1,13 @@
 # CrossPost
 
-Post Mastodon Posts to Twitter easily!
+Post Mastodon Posts to Twitter and/or BlueSky easily!
 
-CrossPost will allows you to create a simple poster from Mastodon->Twitter.
+CrossPost will allows you to create a simple poster from Mastodon->Twitter and/or
+Mastodon->BlueSky.
 
 ## Instructions
 
-To run CrossPost, you will need Twitter and Mastodon API keys.
+To run CrossPost, you will need (Twitter and/or BlueSky) and Mastodon API keys.
 
 ### Twitter
 
@@ -30,6 +31,14 @@ Click on the `Development` tab on the bottom left. Create an application and mak
 sure the `read:accounts` and `read:statuses` permissions are selected.
 
 Save the `Client key`, `Client secret` and `Your access token` values.
+
+### BlueSky
+
+BlueSky's API is pretty simple, you'll just need a username and password. It's
+recommended to not your your actual password, but create an App Password via
+Settings->App Passwords->Add App Password. This will prevent breakage if you change
+your password or enabled 2-factor _(When BlueSky can do that finally)_ and can
+be revoked if needed.
 
 ## Configuration
 
@@ -57,6 +66,10 @@ Here is an example configration that covers two separate accounts.
                 "client_secret": "client_secret_value",
                 "access_token": "access_token_value"
             },
+            "bluesky": {
+                "username": "bluesky_email",
+                "password": "bluesky_app_password"
+            },
             "twitter": {
                 "consumer_key": "consumer_key_value",
                 "consumer_secret": "consumer_secret_value",
@@ -82,3 +95,7 @@ Here is an example configration that covers two separate accounts.
     ]
 }
 ```
+
+The **Mastodon** section is required, but you can specify either **Twitter**,
+**BlueSky** or both if desired! At least one secondary account is required or the
+application will return an error on startup.

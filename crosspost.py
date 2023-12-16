@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+#
 # CrossPost
 #  Post Mastodon Posts to Twitter.
 #
@@ -20,18 +21,28 @@
 
 import threading
 
-from requests import get
+from re import compile
+from os.path import isfile
 from tempfile import mkstemp
 from bs4 import BeautifulSoup
+from requests import post, get
+from mimetypes import guess_type
 from sys import exit, stderr, argv
 from json import loads, JSONDecodeError
+from datetime import datetime, timezone
 from os import fdopen, remove, kill, getpid
 from mastodon import Mastodon, StreamListener
 from tweepy import Client, OAuth1UserHandler, API
 from signal import sigwait, SIGINT, SIGKILL, SIGSTOP
 
-
-HELP_TEXT = """CrossPost v1 - Post Mastodon Posts to Twitter
+URLS = compile(
+    rb"[$|\W](https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*[-a-"
+    + rb"zA-Z0-9@%_\+~#//=])?)"
+)
+MENTIONS = compile(
+    rb"[$|\W](@([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
+)
+HELP_TEXT = """CrossPost v2 - Post Mastodon Posts to Twitter (and BlueSky!)
 
 Usage:
     {bin} <config_file>
@@ -47,6 +58,10 @@ JSON Configuration Example:
                 "client_id": "client_id_value",
                 "client_secret": "client_secret_value",
                 "access_token": "access_token_value"
+            }},
+            "bluesky": {{
+                "username": "bluesky_email",
+                "password": "bluesky_app_password"
             }},
             "twitter": {{
                 "consumer_key": "consumer_key_value",
@@ -79,11 +94,79 @@ can be used as a quasi-link shortener.
 """
 
 
+def _get_media(media):
+    if not isinstance(media, list) or len(media) == 0:
+        return None
+    r = list()
+    for e in media:
+        i, n = mkstemp(text=False)
+        with fdopen(i, mode="wb") as f:
+            with get(e["url"], stream=True) as x:
+                f.write(x.content)
+        r.append(n)
+    return r
+
+
+def _except_hook(args):
+    print(f"Received an uncaught Thread error {args.exc_type} ({args.exc_value})!")
+    kill(getpid(), SIGINT)
+
+
+def _parse_and_load(config):
+    if not isinstance(config, dict) or len(config) == 0:
+        raise ValueError("bad config entry")
+    if "mastodon" not in config:
+        raise ValueError('missing "mastodon" entry')
+    if not isinstance(config["twitter"], dict) or len(config["twitter"]) == 0:
+        raise ValueError('"twitter" entry is invalid')
+    if not isinstance(config["mastodon"], dict) or len(config["mastodon"]) == 0:
+        raise ValueError('"mastodon" entry is invalid')
+    if "server" not in config["mastodon"]:
+        raise ValueError('missing "server" in "mastodon" entry')
+    if "client_id" not in config["mastodon"]:
+        raise ValueError('missing "client_id" in "mastodon" entry')
+    if "client_secret" not in config["mastodon"]:
+        raise ValueError('missing "client_secret" in "mastodon" entry')
+    if "access_token" not in config["mastodon"]:
+        raise ValueError('missing "access_token" in "mastodon" entry')
+    t, b = None, None
+    if "twitter" in config:
+        if "consumer_key" not in config["twitter"]:
+            raise ValueError('missing "consumer_key" in "twitter" entry')
+        if "consumer_secret" not in config["twitter"]:
+            raise ValueError('missing "consumer_secret" in "twitter" entry')
+        if "access_token" not in config["twitter"]:
+            raise ValueError('missing "access_token" in "twitter" entry')
+        if "access_secret" not in config["twitter"]:
+            raise ValueError('missing "access_secret" in "twitter" entry')
+        t = Twitter(
+            config["twitter"]["consumer_key"],
+            config["twitter"]["consumer_secret"],
+            config["twitter"]["access_token"],
+            config["twitter"]["access_secret"],
+        )
+    if "bluesky" in config:
+        if "username" not in config["bluesky"]:
+            raise ValueError('missing "username" in "bluesky" entry')
+        if "password" not in config["bluesky"]:
+            raise ValueError('missing "password" in "bluesky" entry')
+        b = (config["bluesky"]["username"], config["bluesky"]["password"])
+    if t is None and b is None:
+        raise ValueError("missing and additional account object")
+    m = Mastodon(
+        api_base_url=config["mastodon"]["server"],
+        client_id=config["mastodon"]["client_id"],
+        client_secret=config["mastodon"]["client_secret"],
+        access_token=config["mastodon"]["access_token"],
+    )
+    return CrossPoster(t, b, m, config.get("prefix"))
+
+
 class Twitter(object):
-    __slots__ = ("v1", "v2")
+    __slots__ = ("_v1", "_v2")
 
     def __init__(self, consumer_key, consumer_secret, access_token, access_secret):
-        self.v1 = API(
+        self._v1 = API(
             OAuth1UserHandler(
                 consumer_key=consumer_key,
                 consumer_secret=consumer_secret,
@@ -91,35 +174,216 @@ class Twitter(object):
                 access_token_secret=access_secret,
             )
         )
-        self.v2 = Client(
+        self._v2 = Client(
             consumer_key=consumer_key,
             consumer_secret=consumer_secret,
             access_token=access_token,
             access_token_secret=access_secret,
         )
 
-    def post_tweet(self, text, media=None):
+    def post(self, text, media=None):
         if isinstance(media, list) and len(media) > 0:
             a = list()
             for e in media:
-                a.append(self.v1.media_upload(e).media_id)
+                a.append(self._v1.media_upload(e).media_id)
         else:
             a = None
-        return self.v2.create_tweet(text=text, media_ids=a)[0]["id"]
+        return self._v2.create_tweet(text=text, media_ids=a)[0]["id"]
+
+
+class BlueSky(object):
+    __slots__ = ("_did", "_jwt")
+
+    def __init__(self, user):
+        self._authenticate(user[0], user[1])
+
+    @staticmethod
+    def _parse_urls(text):
+        r = list()
+        for m in URLS.finditer(text.encode("UTF-8")):
+            r.append(
+                {
+                    "start": m.start(1),
+                    "end": m.end(1),
+                    "url": m.group(1).decode("UTF-8"),
+                }
+            )
+        return r
+
+    @staticmethod
+    def _prase_facets(text):
+        f = list()
+        for m in BlueSky._prase_mentions(text):
+            r = get(
+                "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
+                params={"handle": m["handle"]},
+            )
+            try:
+                if r.status_code != 200:
+                    continue
+                j = r.json()
+                if "did" not in j:
+                    continue
+                f.append(
+                    {
+                        "index": {
+                            "byteStart": m["start"],
+                            "byteEnd": m["end"],
+                        },
+                        "features": [
+                            {
+                                "$type": "app.bsky.richtext.facet#mention",
+                                "did": j["did"],
+                            }
+                        ],
+                    }
+                )
+                del j
+            finally:
+                r.close()
+                del r
+        for u in BlueSky._parse_urls(text):
+            f.append(
+                {
+                    "index": {
+                        "byteStart": u["start"],
+                        "byteEnd": u["end"],
+                    },
+                    "features": [
+                        {
+                            "$type": "app.bsky.richtext.facet#link",
+                            "uri": u["url"],
+                        }
+                    ],
+                }
+            )
+        return f
+
+    @staticmethod
+    def _prase_mentions(text):
+        r = list()
+        for m in MENTIONS.finditer(text.encode("UTF-8")):
+            r.append(
+                {
+                    "start": m.start(1),
+                    "end": m.end(1),
+                    "handle": m.group(1)[1:].decode("UTF-8"),
+                }
+            )
+        return r
+
+    def _make_blob(self, image):
+        if not isfile(image):
+            raise ValueError(f'file "{image}" is not valid')
+        with open(image, "rb") as f:
+            t, _ = guess_type(image)
+            if not isinstance(t, str) or len(t) == 0:
+                t = "image/jpeg"
+            r = post(
+                "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
+                headers={
+                    "Content-Type": t,
+                    "Authorization": f"Bearer {self._jwt}",
+                },
+                data=f.read(),
+            )
+            try:
+                j = r.json()
+            finally:
+                r.close()
+                del r
+            del t
+            if "error" in j:
+                raise ValueError(j["error"])
+            elif "blob" not in j:
+                raise ValueError(
+                    "xrpc/com.atproto.repo.uploadBlob: returned an invalid response"
+                )
+            return j["blob"]
+
+    def post(self, text, media=None):
+        e = list()
+        if isinstance(media, list) and len(media) > 0:
+            for i in media:
+                if not isinstance(i, str):
+                    raise ValueError("media list must only contain string values")
+                if len(i) == 0:
+                    continue
+                e.append(self._make_blob(i))
+        p = {
+            "$type": "app.bsky.feed.post",
+            "text": text,
+            "langs": ["en-US"],
+            "facets": BlueSky._prase_facets(text),
+            "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        if len(e) > 0:
+            v = list()
+            for i in e:
+                v.append({"alt": "", "image": i})
+            p["embed"] = {
+                "$type": "app.bsky.embed.images",
+                "images": v,
+            }
+            del v
+        del e
+        r = post(
+            "https://bsky.social/xrpc/com.atproto.repo.createRecord",
+            headers={"Authorization": f"Bearer {self._jwt}"},
+            json={
+                "repo": self._did,
+                "record": p,
+                "collection": "app.bsky.feed.post",
+            },
+        )
+        try:
+            j = r.json()
+        finally:
+            r.close()
+            del r
+        if "error" in j:
+            raise ValueError(j["error"])
+        elif "cid" not in j:
+            raise ValueError(
+                "xrpc/com.atproto.repo.createRecord: returned an invalid response"
+            )
+        return j["cid"]
+
+    def _authenticate(self, user, password):
+        r = post(
+            "https://bsky.social/xrpc/com.atproto.server.createSession",
+            json={
+                "identifier": user,
+                "password": password,
+            },
+        )
+        try:
+            j = r.json()
+        finally:
+            r.close()
+            del r
+        if "error" in j:
+            raise ValueError(j["error"])
+        elif "accessJwt" not in j or "did" not in j:
+            raise ValueError(
+                "xrpc/com.atproto.server.createSession: returned an invalid response"
+            )
+        self._did, self._jwt = j["did"], j["accessJwt"]
+        del j
 
 
 class CrossPoster(StreamListener):
-    __slots__ = ("handle", "mastodon", "prefix", "twitter", "uid", "name")
+    __slots__ = ("uid", "name", "handle", "prefix", "twitter", "bluesky", "mastodon")
 
-    def __init__(self, twitter, mastodon, prefix=None):
+    def __init__(self, twitter, bluesky, mastodon, prefix=None):
         StreamListener.__init__(self)
         self.handle = None
         self.prefix = prefix
+        self.bluesky = bluesky
         self.twitter = twitter
         self.mastodon = mastodon
         a = mastodon.account_verify_credentials()
-        self.uid = a["id"]
-        self.name = a["acct"]
+        self.uid, self.name = a["id"], a["acct"]
         del a
 
     def close(self):
@@ -130,17 +394,21 @@ class CrossPoster(StreamListener):
 
     def start(self):
         self.handle = self.mastodon.stream_user(
-            self, run_async=True, reconnect_async=False
+            self, run_async=True, reconnect_async=False, timeout=60
         )
 
     def on_update(self, x):
-        if self.twitter is None:
+        if self.twitter is None and self.bluesky is None:
             return
         if x["account"]["id"] != self.uid:
             return
-        if x["visibility"] != "public":
+        if x["visibility"] != "public" or ("reblogged" in x and x["reblogged"]):
             return
         if x["in_reply_to_id"] is not None or x["in_reply_to_account_id"] is not None:
+            return
+        if "reblog" in x and x["reblog"] is not None:
+            return
+        if "content" not in x or len(x["content"]) == 0:
             return
         print(f'[{self.name}] Received Post "{x["id"]}" by "@{x["account"]["acct"]}"..')
         try:
@@ -158,86 +426,49 @@ class CrossPoster(StreamListener):
             .replace("<br>", "\n"),
             features="html.parser",
         ).text.replace("@twitter.com", "")
-        if len(c) > 280:
-            c = c[276] + " ..."
-        if isinstance(self.prefix, str) and len(self.prefix) > 0:
-            v = self.prefix + "/" + str(x["id"])
-            if len(c) + len(v) + 1 <= 280:
-                c = c + "\n" + v
-            del v
-        try:
-            t = self.twitter.post_tweet(c, m)
-        except Exception as err:
-            return print(f"[{self.name}] Could not post Tweet: {err}!", file=stderr)
-        print(f'[{self.name}] Posted Tweet "{t}"!')
+        if self.twitter is not None:
+            y = c
+            if len(y) > 280:
+                y = y[0:276] + " ..."
+            if isinstance(self.prefix, str) and len(self.prefix) > 0:
+                v = self.prefix + "/" + str(id)
+                if len(y) + len(v) + 1 <= 280:
+                    y = y + "\n" + v
+                del v
+            try:
+                t = self.twitter.post(y, m)
+            except Exception as err:
+                print(f"[{self.name}] Could not post Tweet: {err}!", file=stderr)
+            else:
+                print(f'[{self.name}] Posted Tweet "{t}"!')
+            del y
+        if self.bluesky is not None:
+            y = c
+            if len(y) > 300:
+                y = y[0:290] + " ..."
+            if isinstance(self.prefix, str) and len(self.prefix) > 0:
+                v = self.prefix + "/" + str(id)
+                if len(y) + len(v) + 1 <= 300:
+                    y = y + "\n" + v
+                del v
+            try:
+                t = BlueSky(self.bluesky).post(y, m)
+            except Exception as err:
+                print(f"[{self.name}] Could not post Skeet: {err}!", file=stderr)
+            else:
+                print(f'[{self.name}] Posted Skeet "{t}"!')
+        del c
         if not isinstance(m, list) or len(m) == 0:
             return
         for i in m:
             try:
                 remove(i)
             except OSError as err:
-                print(err)
+                print(
+                    f'[{self.name}] Could not delete temp file "{i}": {err}!',
+                    file=stderr,
+                )
         del m
-
-
-def _get_media(media):
-    if not isinstance(media, list) or len(media) == 0:
-        return None
-    r = list()
-    for e in media:
-        i, n = mkstemp(text=False)
-        with fdopen(i, mode="wb") as f:
-            with get(e["url"], stream=True) as x:
-                f.write(x.content)
-        r.append(n)
-    return r
-
-
-def _except_hook(_args):
-    print("Thread indicated a failure, signaling closure..")
-    kill(getpid(), SIGINT)
-
-
-def _parse_and_load(config):
-    if not isinstance(config, dict) or len(config) == 0:
-        raise ValueError("bad config entry")
-    if "twitter" not in config:
-        raise ValueError('missing "twitter" entry')
-    if "mastodon" not in config:
-        raise ValueError('missing "mastodon" entry')
-    if not isinstance(config["twitter"], dict) or len(config["twitter"]) == 0:
-        raise ValueError('"twitter" entry is invalid')
-    if not isinstance(config["mastodon"], dict) or len(config["mastodon"]) == 0:
-        raise ValueError('"mastodon" entry is invalid')
-    if "server" not in config["mastodon"]:
-        raise ValueError('missing "server" in "mastodon" entry')
-    if "client_id" not in config["mastodon"]:
-        raise ValueError('missing "client_id" in "mastodon" entry')
-    if "client_secret" not in config["mastodon"]:
-        raise ValueError('missing "client_secret" in "mastodon" entry')
-    if "access_token" not in config["mastodon"]:
-        raise ValueError('missing "access_token" in "mastodon" entry')
-    if "consumer_key" not in config["twitter"]:
-        raise ValueError('missing "consumer_key" in "twitter" entry')
-    if "consumer_secret" not in config["twitter"]:
-        raise ValueError('missing "consumer_secret" in "twitter" entry')
-    if "access_token" not in config["twitter"]:
-        raise ValueError('missing "access_token" in "twitter" entry')
-    if "access_secret" not in config["twitter"]:
-        raise ValueError('missing "access_secret" in "twitter" entry')
-    m = Mastodon(
-        api_base_url=config["mastodon"]["server"],
-        client_id=config["mastodon"]["client_id"],
-        client_secret=config["mastodon"]["client_secret"],
-        access_token=config["mastodon"]["access_token"],
-    )
-    t = Twitter(
-        config["twitter"]["consumer_key"],
-        config["twitter"]["consumer_secret"],
-        config["twitter"]["access_token"],
-        config["twitter"]["access_secret"],
-    )
-    return CrossPoster(t, m, config.get("prefix"))
 
 
 if __name__ == "__main__":
