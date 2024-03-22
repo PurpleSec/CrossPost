@@ -36,11 +36,12 @@ from tweepy import Client, OAuth1UserHandler, API
 from signal import sigwait, SIGINT, SIGKILL, SIGSTOP
 
 URLS = compile(
-    rb"[$|\W](https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*[-a-"
+    rb"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*[-a-"
     + rb"zA-Z0-9@%_\+~#//=])?)"
 )
+TAGS = compile(rb"((#[^\d\s]\S*)(?=\s)?)")
 MENTIONS = compile(
-    rb"[$|\W](@([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
+    rb"(@([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
 )
 HELP_TEXT = """CrossPost v2 - Post Mastodon Posts to Twitter (and BlueSky!)
 
@@ -211,6 +212,23 @@ class BlueSky(object):
         return r
 
     @staticmethod
+    def _parse_tags(text):
+        r = list()
+        for m in TAGS.finditer(text.encode("UTF-8")):
+            v = m.group(1).decode("UTF-8")
+            if len(v) <= 1:
+                continue
+            r.append(
+                {
+                    "start": m.start(1),
+                    "end": m.end(1),
+                    "tag": v[1:],
+                }
+            )
+            del v
+        return r
+
+    @staticmethod
     def _prase_facets(text):
         f = list()
         for m in BlueSky._prase_mentions(text):
@@ -253,6 +271,21 @@ class BlueSky(object):
                         {
                             "$type": "app.bsky.richtext.facet#link",
                             "uri": u["url"],
+                        }
+                    ],
+                }
+            )
+        for t in BlueSky._parse_tags(text):
+            f.append(
+                {
+                    "index": {
+                        "byteStart": t["start"],
+                        "byteEnd": t["end"],
+                    },
+                    "features": [
+                        {
+                            "$type": "app.bsky.richtext.facet#tag",
+                            "tag": t["tag"],
                         }
                     ],
                 }
@@ -425,9 +458,9 @@ class CrossPoster(StreamListener):
             .replace("<br/>", "\n")
             .replace("<br>", "\n"),
             features="html.parser",
-        ).text.replace("@twitter.com", "")
+        ).text
         if self.twitter is not None:
-            y = c
+            y = c.replace("@twitter.com", "")
             if len(y) > 280:
                 y = y[0:276] + " ..."
             if isinstance(self.prefix, str) and len(self.prefix) > 0:
@@ -443,7 +476,7 @@ class CrossPoster(StreamListener):
                 print(f'[{self.name}] Posted Tweet "{t}"!')
             del y
         if self.bluesky is not None:
-            y = c
+            y = c.replace("@twitter.com", ".bsky.social")
             if len(y) > 300:
                 y = y[0:290] + " ..."
             if isinstance(self.prefix, str) and len(self.prefix) > 0:
