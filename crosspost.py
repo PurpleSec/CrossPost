@@ -464,7 +464,7 @@ class CrossPoster(StreamListener):
             if len(y) > 280:
                 y = y[0:276] + " ..."
             if isinstance(self.prefix, str) and len(self.prefix) > 0:
-                v = self.prefix + "/" + str(id)
+                v = self.prefix + "/" + str(x["id"])
                 if len(y) + len(v) + 1 <= 280:
                     y = y + "\n" + v
                 del v
