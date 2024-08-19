@@ -99,3 +99,5 @@ Here is an example configration that covers two separate accounts.
 The **Mastodon** section is required, but you can specify either **Twitter**,
 **BlueSky** or both if desired! At least one secondary account is required or the
 application will return an error on startup.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Z8Z4121TDS)
