@@ -1,9 +1,9 @@
 #!/usr/bin/python3
 #
 # CrossPost
-#  Post Mastodon Posts to Twitter.
+#  Post Mastodon Posts to Twitter and BlueSky
 #
-# Copyright (C) 2023 iDigitalFlame
+# Copyright (C) 2025 iDigitalFlame
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -40,10 +40,8 @@ URLS = compile(
     + rb"zA-Z0-9@%_\+~#//=])?)"
 )
 TAGS = compile(rb"((#[^\d\s]\S*)(?=\s)?)")
-MENTIONS = compile(
-    rb"(@([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
-)
-HELP_TEXT = """CrossPost v2 - Post Mastodon Posts to Twitter (and BlueSky!)
+MENTIONS = compile(rb"@([a-zA-Z0-9-]{0,61})(\s|$)")
+HELP_TEXT = """CrossPost v2.5 - Post Mastodon Posts to Twitter (and BlueSky!)
 
 Usage:
     {bin} <config_file>
@@ -69,6 +67,11 @@ JSON Configuration Example:
                 "consumer_secret": "consumer_secret_value",
                 "access_token": "access_token_value",
                 "access_secret": "access_secret_value"
+            }},
+            "replace": {{
+                "emoji1": "emoji",
+                "emoji2": "emoji",
+                "emoji3": "emoji",
             }}
         }},
         {{
@@ -89,9 +92,13 @@ JSON Configuration Example:
     ]
 }}
 
-The only optional value is the "prefix" value which takes a URL value that will
-be appended to Tweets (if the char limit allows!) with the Mastodon post ID. This
-can be used as a quasi-link shortener.
+The only optional values are the "prefix" and "replace" values.
+
+Prefix which takes a URL value that will be appended to Tweets (if the char limit
+allows!) with the Mastodon post ID. This can be used as a quasi-link shortener.
+
+Replace will replace the specified string matching phrases with the specified string
+or character (or emoji!). These are case sensitive.
 """
 
 
@@ -118,8 +125,6 @@ def _parse_and_load(config):
         raise ValueError("bad config entry")
     if "mastodon" not in config:
         raise ValueError('missing "mastodon" entry')
-    if not isinstance(config["twitter"], dict) or len(config["twitter"]) == 0:
-        raise ValueError('"twitter" entry is invalid')
     if not isinstance(config["mastodon"], dict) or len(config["mastodon"]) == 0:
         raise ValueError('"mastodon" entry is invalid')
     if "server" not in config["mastodon"]:
@@ -132,6 +137,8 @@ def _parse_and_load(config):
         raise ValueError('missing "access_token" in "mastodon" entry')
     t, b = None, None
     if "twitter" in config:
+        if not isinstance(config["twitter"], dict) or len(config["twitter"]) == 0:
+            raise ValueError('"twitter" entry is invalid')
         if "consumer_key" not in config["twitter"]:
             raise ValueError('missing "consumer_key" in "twitter" entry')
         if "consumer_secret" not in config["twitter"]:
@@ -147,6 +154,8 @@ def _parse_and_load(config):
             config["twitter"]["access_secret"],
         )
     if "bluesky" in config:
+        if not isinstance(config["bluesky"], dict) or len(config["bluesky"]) == 0:
+            raise ValueError('"bluesky" entry is invalid')
         if "username" not in config["bluesky"]:
             raise ValueError('missing "username" in "bluesky" entry')
         if "password" not in config["bluesky"]:
@@ -160,7 +169,7 @@ def _parse_and_load(config):
         client_secret=config["mastodon"]["client_secret"],
         access_token=config["mastodon"]["access_token"],
     )
-    return CrossPoster(t, b, m, config.get("prefix"))
+    return CrossPoster(t, b, m, config.get("prefix"), config.get("replace"))
 
 
 class Twitter(object):
@@ -199,6 +208,42 @@ class BlueSky(object):
         self._authenticate(user[0], user[1])
 
     @staticmethod
+    def _find_user(name):
+        try:
+            r = get(
+                "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
+                params={"handle": f"{name}.bsky.social"},
+            )
+            if r.status_code == 200:
+                v = r.json()
+                if "did" in v:
+                    return v["did"]
+                del v
+        finally:
+            r.close()
+            del r
+        try:
+            r = get(
+                "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors",
+                params={"q": name},
+            )
+            if r.status_code != 200:
+                return None
+            v = r.json().get("actors")
+            if not isinstance(v, list) or len(v) == 0:
+                return None
+            for i in v:
+                if "did" not in i or "handle" not in i:
+                    continue
+                if i["handle"].lower().startswith(name.lower()):
+                    return i["did"]
+            del v
+        finally:
+            r.close()
+            del r
+        return None
+
+    @staticmethod
     def _parse_urls(text):
         r = list()
         for m in URLS.finditer(text.encode("UTF-8")):
@@ -232,34 +277,24 @@ class BlueSky(object):
     def _prase_facets(text):
         f = list()
         for m in BlueSky._prase_mentions(text):
-            r = get(
-                "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
-                params={"handle": m["handle"]},
+            v = BlueSky._find_user(m["handle"])
+            if v is None:
+                continue
+            f.append(
+                {
+                    "index": {
+                        "byteStart": m["start"],
+                        "byteEnd": m["end"],
+                    },
+                    "features": [
+                        {
+                            "$type": "app.bsky.richtext.facet#mention",
+                            "did": v,
+                        }
+                    ],
+                }
             )
-            try:
-                if r.status_code != 200:
-                    continue
-                j = r.json()
-                if "did" not in j:
-                    continue
-                f.append(
-                    {
-                        "index": {
-                            "byteStart": m["start"],
-                            "byteEnd": m["end"],
-                        },
-                        "features": [
-                            {
-                                "$type": "app.bsky.richtext.facet#mention",
-                                "did": j["did"],
-                            }
-                        ],
-                    }
-                )
-                del j
-            finally:
-                r.close()
-                del r
+            del v
         for u in BlueSky._parse_urls(text):
             f.append(
                 {
@@ -296,13 +331,17 @@ class BlueSky(object):
     def _prase_mentions(text):
         r = list()
         for m in MENTIONS.finditer(text.encode("UTF-8")):
+            v = m.start(1)
+            if v > 0:
+                v -= 1
             r.append(
                 {
-                    "start": m.start(1),
+                    "start": v,
                     "end": m.end(1),
-                    "handle": m.group(1)[1:].decode("UTF-8"),
+                    "handle": m.group(1).decode("UTF-8"),
                 }
             )
+            del v
         return r
 
     def _make_blob(self, image):
@@ -406,14 +445,24 @@ class BlueSky(object):
 
 
 class CrossPoster(StreamListener):
-    __slots__ = ("uid", "name", "handle", "prefix", "twitter", "bluesky", "mastodon")
+    __slots__ = (
+        "uid",
+        "name",
+        "handle",
+        "prefix",
+        "replace",
+        "twitter",
+        "bluesky",
+        "mastodon",
+    )
 
-    def __init__(self, twitter, bluesky, mastodon, prefix=None):
+    def __init__(self, twitter, bluesky, mastodon, prefix=None, replace=None):
         StreamListener.__init__(self)
         self.handle = None
         self.prefix = prefix
         self.bluesky = bluesky
         self.twitter = twitter
+        self.replace = replace
         self.mastodon = mastodon
         a = mastodon.account_verify_credentials()
         self.uid, self.name = a["id"], a["acct"]
@@ -437,6 +486,7 @@ class CrossPoster(StreamListener):
             return
         if x["visibility"] != "public" or ("reblogged" in x and x["reblogged"]):
             return
+        print(x)
         if x["in_reply_to_id"] is not None or x["in_reply_to_account_id"] is not None:
             return
         if "reblog" in x and x["reblog"] is not None:
@@ -459,6 +509,13 @@ class CrossPoster(StreamListener):
             .replace("<br>", "\n"),
             features="html.parser",
         ).text
+        if isinstance(self.replace, dict):
+            for k, v in self.replace.items():
+                if not isinstance(k, str) or len(k) == 0:
+                    continue
+                if not isinstance(v, str) or len(v) == 0:
+                    continue
+                c = c.replace(k, v)
         if self.twitter is not None:
             y = c.replace("@twitter.com", "")
             if len(y) > 280:
@@ -476,7 +533,7 @@ class CrossPoster(StreamListener):
                 print(f'[{self.name}] Posted Tweet "{t}"!')
             del y
         if self.bluesky is not None:
-            y = c.replace("@twitter.com", ".bsky.social")
+            y = c.replace("@twitter.com", "")
             if len(y) > 300:
                 y = y[0:290] + " ..."
             if isinstance(self.prefix, str) and len(self.prefix) > 0:
