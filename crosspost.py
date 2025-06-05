@@ -25,9 +25,10 @@ from re import compile
 from os.path import isfile
 from tempfile import mkstemp
 from bs4 import BeautifulSoup
-from requests import post, get
 from mimetypes import guess_type
+from requests import get, session
 from sys import exit, stderr, argv
+from urllib.request import getproxies
 from json import loads, JSONDecodeError
 from datetime import datetime, timezone
 from os import fdopen, remove, kill, getpid
@@ -40,8 +41,9 @@ URLS = compile(
     + rb"zA-Z0-9@%_\+~#//=])?)"
 )
 TAGS = compile(rb"((#[^\d\s]\S*)(?=\s)?)")
+PROXIES = getproxies()
 MENTIONS = compile(rb"@([a-zA-Z0-9-]{0,61})(\s|$)")
-HELP_TEXT = """CrossPost v2.5 - Post Mastodon Posts to Twitter (and BlueSky!)
+HELP_TEXT = """CrossPost v2.6 - Post Mastodon Posts to Twitter (and BlueSky!)
 
 Usage:
     {bin} <config_file>
@@ -109,7 +111,7 @@ def _get_media(media):
     for e in media:
         i, n = mkstemp(text=False)
         with fdopen(i, mode="wb") as f:
-            with get(e["url"], stream=True) as x:
+            with get(e["url"], stream=True, proxies=PROXIES) as x:
                 f.write(x.content)
         r.append(n)
     return r
@@ -160,7 +162,7 @@ def _parse_and_load(config):
             raise ValueError('missing "username" in "bluesky" entry')
         if "password" not in config["bluesky"]:
             raise ValueError('missing "password" in "bluesky" entry')
-        b = (config["bluesky"]["username"], config["bluesky"]["password"])
+        b = BlueSky(config["bluesky"]["username"], config["bluesky"]["password"])
     if t is None and b is None:
         raise ValueError("missing and additional account object")
     m = Mastodon(
@@ -169,6 +171,8 @@ def _parse_and_load(config):
         client_secret=config["mastodon"]["client_secret"],
         access_token=config["mastodon"]["access_token"],
     )
+    if PROXIES is not None and len(PROXIES) > 0:
+        m.session.proxies = PROXIES
     return CrossPoster(t, b, m, config.get("prefix"), config.get("replace"))
 
 
@@ -190,6 +194,9 @@ class Twitter(object):
             access_token=access_token,
             access_token_secret=access_secret,
         )
+        if PROXIES is not None and len(PROXIES) > 0:
+            self._v1.session.proxies = PROXIES
+            self._v2.session.proxies = PROXIES
 
     def post(self, text, media=None):
         if isinstance(media, list) and len(media) > 0:
@@ -202,46 +209,13 @@ class Twitter(object):
 
 
 class BlueSky(object):
-    __slots__ = ("_did", "_jwt")
+    __slots__ = ("_did", "_jwt", "_req")
 
-    def __init__(self, user):
-        self._authenticate(user[0], user[1])
-
-    @staticmethod
-    def _find_user(name):
-        try:
-            r = get(
-                "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
-                params={"handle": f"{name}.bsky.social"},
-            )
-            if r.status_code == 200:
-                v = r.json()
-                if "did" in v:
-                    return v["did"]
-                del v
-        finally:
-            r.close()
-            del r
-        try:
-            r = get(
-                "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors",
-                params={"q": name},
-            )
-            if r.status_code != 200:
-                return None
-            v = r.json().get("actors")
-            if not isinstance(v, list) or len(v) == 0:
-                return None
-            for i in v:
-                if "did" not in i or "handle" not in i:
-                    continue
-                if i["handle"].lower().startswith(name.lower()):
-                    return i["did"]
-            del v
-        finally:
-            r.close()
-            del r
-        return None
+    def __init__(self, user, password):
+        self._req = session()
+        if PROXIES is not None and len(PROXIES) > 0:
+            self._req.proxies = PROXIES
+        self._authenticate(user, password)
 
     @staticmethod
     def _parse_urls(text):
@@ -274,10 +248,90 @@ class BlueSky(object):
         return r
 
     @staticmethod
-    def _prase_facets(text):
+    def _prase_mentions(text):
+        r = list()
+        for m in MENTIONS.finditer(text.encode("UTF-8")):
+            v = m.start(1)
+            if v > 0:
+                v -= 1
+            r.append(
+                {
+                    "start": v,
+                    "end": m.end(1),
+                    "handle": m.group(1).decode("UTF-8"),
+                }
+            )
+            del v
+        return r
+
+    def _find_user(self, name):
+        try:
+            r = self._req.get(
+                "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
+                params={"handle": f"{name}.bsky.social"},
+            )
+            if r.status_code == 200:
+                v = r.json()
+                if "did" in v:
+                    return v["did"]
+                del v
+        finally:
+            r.close()
+            del r
+        try:
+            r = self._req.get(
+                "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors",
+                params={"q": name},
+            )
+            if r.status_code != 200:
+                return None
+            v = r.json().get("actors")
+            if not isinstance(v, list) or len(v) == 0:
+                return None
+            for i in v:
+                if "did" not in i or "handle" not in i:
+                    continue
+                if i["handle"].lower().startswith(name.lower()):
+                    return i["did"]
+            del v
+        finally:
+            r.close()
+            del r
+        return None
+
+    def _make_blob(self, image):
+        if not isfile(image):
+            raise ValueError(f'file "{image}" is not valid')
+        with open(image, "rb") as f:
+            t, _ = guess_type(image)
+            if not isinstance(t, str) or len(t) == 0:
+                t = "image/jpeg"
+            r = self._req.post(
+                "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
+                headers={
+                    "Content-Type": t,
+                    "Authorization": f"Bearer {self._jwt}",
+                },
+                data=f.read(),
+            )
+            try:
+                j = r.json()
+            finally:
+                r.close()
+                del r
+            del t
+            if "error" in j:
+                raise ValueError(j["error"])
+            elif "blob" not in j:
+                raise ValueError(
+                    "xrpc/com.atproto.repo.uploadBlob: returned an invalid response"
+                )
+            return j["blob"]
+
+    def _prase_facets(self, text):
         f = list()
         for m in BlueSky._prase_mentions(text):
-            v = BlueSky._find_user(m["handle"])
+            v = self._find_user(m["handle"])
             if v is None:
                 continue
             f.append(
@@ -327,52 +381,6 @@ class BlueSky(object):
             )
         return f
 
-    @staticmethod
-    def _prase_mentions(text):
-        r = list()
-        for m in MENTIONS.finditer(text.encode("UTF-8")):
-            v = m.start(1)
-            if v > 0:
-                v -= 1
-            r.append(
-                {
-                    "start": v,
-                    "end": m.end(1),
-                    "handle": m.group(1).decode("UTF-8"),
-                }
-            )
-            del v
-        return r
-
-    def _make_blob(self, image):
-        if not isfile(image):
-            raise ValueError(f'file "{image}" is not valid')
-        with open(image, "rb") as f:
-            t, _ = guess_type(image)
-            if not isinstance(t, str) or len(t) == 0:
-                t = "image/jpeg"
-            r = post(
-                "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
-                headers={
-                    "Content-Type": t,
-                    "Authorization": f"Bearer {self._jwt}",
-                },
-                data=f.read(),
-            )
-            try:
-                j = r.json()
-            finally:
-                r.close()
-                del r
-            del t
-            if "error" in j:
-                raise ValueError(j["error"])
-            elif "blob" not in j:
-                raise ValueError(
-                    "xrpc/com.atproto.repo.uploadBlob: returned an invalid response"
-                )
-            return j["blob"]
-
     def post(self, text, media=None):
         e = list()
         if isinstance(media, list) and len(media) > 0:
@@ -386,7 +394,7 @@ class BlueSky(object):
             "$type": "app.bsky.feed.post",
             "text": text,
             "langs": ["en-US"],
-            "facets": BlueSky._prase_facets(text),
+            "facets": self._prase_facets(text),
             "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         if len(e) > 0:
@@ -399,7 +407,7 @@ class BlueSky(object):
             }
             del v
         del e
-        r = post(
+        r = self._req.post(
             "https://bsky.social/xrpc/com.atproto.repo.createRecord",
             headers={"Authorization": f"Bearer {self._jwt}"},
             json={
@@ -422,7 +430,7 @@ class BlueSky(object):
         return j["cid"]
 
     def _authenticate(self, user, password):
-        r = post(
+        r = self._req.post(
             "https://bsky.social/xrpc/com.atproto.server.createSession",
             json={
                 "identifier": user,
@@ -486,7 +494,6 @@ class CrossPoster(StreamListener):
             return
         if x["visibility"] != "public" or ("reblogged" in x and x["reblogged"]):
             return
-        print(x)
         if x["in_reply_to_id"] is not None or x["in_reply_to_account_id"] is not None:
             return
         if "reblog" in x and x["reblog"] is not None:
@@ -537,12 +544,12 @@ class CrossPoster(StreamListener):
             if len(y) > 300:
                 y = y[0:290] + " ..."
             if isinstance(self.prefix, str) and len(self.prefix) > 0:
-                v = self.prefix + "/" + str(id)
+                v = self.prefix + "/" + str(x["id"])
                 if len(y) + len(v) + 1 <= 300:
                     y = y + "\n" + v
                 del v
             try:
-                t = BlueSky(self.bluesky).post(y, m)
+                t = self.bluesky.post(y, m)
             except Exception as err:
                 print(f"[{self.name}] Could not post Skeet: {err}!", file=stderr)
             else:
