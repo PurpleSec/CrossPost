@@ -3,7 +3,7 @@
 # CrossPost
 #  Post Mastodon Posts to Twitter and BlueSky
 #
-# Copyright (C) 2025 iDigitalFlame
+# Copyright (C) 2021 - 2025 PurpleSec Team
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
