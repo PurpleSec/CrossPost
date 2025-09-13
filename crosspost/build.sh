@@ -21,10 +21,8 @@ if [ $# -ge 1 ]; then
     output="$1"
 fi
 
-cd crosspost;
 echo "Building.."
 go build -buildvcs=false -trimpath -ldflags "-s -w -X main.buildVersion=$(date +%F)_$(git rev-parse --short HEAD 2> /dev/null || echo "non-git")" -o "$output" cmd/main.go
-cd - 1> /dev/null
 
 which upx &> /dev/null
 if [ $? -eq 0 ] && [ -f "$output" ]; then

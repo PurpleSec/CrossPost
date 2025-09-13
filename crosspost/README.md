@@ -5,9 +5,6 @@ Post Mastodon Posts to Twitter and/or BlueSky easily!
 CrossPost will allows you to create a simple poster from Mastodon->Twitter and/or
 Mastodon->BlueSky.
 
-See the new [Go Version](crosspost/README.md) for an easier build and better
-compatibility!
-
 ## Instructions
 
 To run CrossPost, you will need (Twitter and/or BlueSky) and Mastodon API keys.
@@ -43,15 +40,20 @@ Settings->App Passwords->Add App Password. This will prevent breakage if you cha
 your password or enabled 2-factor _(When BlueSky can do that finally)_ and can
 be revoked if needed.
 
+## Building
+
+Building CrossPost requires running the `build.sh` binary in this directory.
+This will build and UPX pack (if `upx` is installed) the resulting binary.
+By default, if no arguments are specified, it will build it in the `bin` directory
+in the local `crosspost` directory. Specifying a path as the first argument will
+build and place the binary at the specified path.
+
 ## Configuration
 
 Copy a version of the `Example Configuration` below and fill in the values you
 got from the instructions above.
 
-Make sure to install the python requirements for CrossPost by using the
-`pip install -r requirements.txt` while in the CrossPost directory.
-
-Now all you have to do is run it using the `crosspost.py <config_file>` (the
+Now all you have to do is run it using the `./crosspost -f <config_file>` (the
 "<config_file>" value should be replaced with the path to the config file you
 created).
 
