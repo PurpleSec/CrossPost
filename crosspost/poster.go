@@ -128,12 +128,12 @@ func (p *postAccount) post(x context.Context, g *sync.WaitGroup, o <-chan postDa
 			g.Done()
 			return
 		case d := <-o:
-			/*if p.tw != nil {
+			if p.tw != nil {
 				p.parent.log.Trace(`[poster/%s]: Sending post to Twitter poster..`, p.name)
 				if err := p.tw.post(x, &d); err != nil {
 					p.parent.log.Debug(`[poster/%s]: Twitter post failed: %s!`, p.name, err.Error())
 				}
-			}*/
+			}
 			if p.blue != nil {
 				p.parent.log.Trace(`[poster/%s]: Sending post to BlueSky poster..`, p.name)
 				if err := p.blue.post(x, &d); err != nil {
@@ -150,7 +150,11 @@ func (p *postAccount) handle(x context.Context, o chan<- postData, e *mastodon.S
 		p.parent.log.Debug(`[poster/%s]: Ignoring status from "%s" as it's not from "%s"..`, p.name, e.Account.ID, p.user)
 		return
 	}
-	if e.Visibility != "direct" || e.Reblog != nil || e.InReplyToID != nil || e.InReplyToAccountID != nil || len(e.Content) == 0 {
+	p.parent.log.Trace(
+		`[poster/%s]: Status "%s", visibility=%s, reblog=%v, in_reply_to_id=%v, in_reply_to_account_id=%v, len(content)=%d.`,
+		p.name, e.ID, e.Visibility, e.Reblog, e.InReplyToID, e.InReplyToAccountID, len(e.Content),
+	)
+	if e.Visibility != "public" || e.Reblog != nil || e.InReplyToID != nil || e.InReplyToAccountID != nil || len(e.Content) == 0 {
 		p.parent.log.Debug(`[poster/%s]: Ignoring status from "%s" as it does not match the content criteria..`, p.name, e.ID)
 		return
 	}
@@ -230,6 +234,8 @@ func (p *postAccount) listen(x context.Context, o chan<- postData, i <-chan mast
 			switch v := e.(type) {
 			case *mastodon.ErrorEvent:
 				p.parent.log.Error(`[poster/%s]: Received an error from the stream: %s!`, p.name, v.Err.Error())
+				p.parent.cancel()
+				return
 			case *mastodon.UpdateEvent:
 				p.handle(x, o, v.Status)
 			default:

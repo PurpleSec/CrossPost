@@ -46,16 +46,17 @@ type CrossPost struct {
 // This function returns any errors that occur during shutdown.
 func (c *CrossPost) Run() error {
 	var (
-		o = make(chan os.Signal, 1)
-		x context.Context
-		g sync.WaitGroup
+		o   = make(chan os.Signal, 1)
+		x   context.Context
+		g   sync.WaitGroup
+		err error
 	)
 	signal.Notify(o, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	x, c.cancel = context.WithCancel(context.Background())
 	c.log.Info("CrossPost Started, spinning up sender/receiver threads..")
 	for i := range c.accounts {
 		c.log.Debug(`[%s]: Starting stream monitor "%s"..`, c.accounts[i].name, c.accounts[i].name)
-		if err := c.accounts[i].start(x, &g); err != nil {
+		if err = c.accounts[i].start(x, &g); err != nil {
 			c.log.Debug(`[%s]: Stream monitor "%s" start failed: %s!`, c.accounts[i].name, c.accounts[i].name, err.Error())
 			goto cleanup
 		}
@@ -69,11 +70,14 @@ func (c *CrossPost) Run() error {
 		}
 	}
 cleanup:
-	signal.Stop(o)
+	if signal.Stop(o); x.Err() != nil {
+		// Propagate any errors from the listener.
+		err = errors.New(`connection closed`)
+	}
 	c.cancel()
 	g.Wait()
 	close(o)
-	return nil
+	return err
 }
 
 // New returns a new CrossPost instance based on the passed config file path. This
