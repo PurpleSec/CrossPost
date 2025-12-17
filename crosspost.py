@@ -20,21 +20,20 @@
 #
 
 import threading
-
 from re import compile
 from os.path import isfile
 from tempfile import mkstemp
 from bs4 import BeautifulSoup
 from mimetypes import guess_type
 from requests import get, session
-from sys import exit, stderr, argv
+from sys import argv, exit, stderr
 from urllib.request import getproxies
-from json import loads, JSONDecodeError
 from datetime import datetime, timezone
-from os import fdopen, remove, kill, getpid
+from json import JSONDecodeError, loads
+from os import kill, fdopen, getpid, remove
 from mastodon import Mastodon, StreamListener
-from tweepy import Client, OAuth1UserHandler, API
-from signal import sigwait, SIGINT, SIGKILL, SIGSTOP
+from tweepy import API, Client, OAuth1UserHandler
+from signal import SIGINT, SIGKILL, SIGSTOP, sigwait
 
 URLS = compile(
     rb"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*[-a-"
