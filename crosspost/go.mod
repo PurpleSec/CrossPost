@@ -6,7 +6,7 @@ require (
 	github.com/PurpleSec/logx v1.6.1
 	github.com/mattn/go-mastodon v0.0.10
 	github.com/michimani/gotwi v0.18.1
-	golang.org/x/net v0.44.0
+	golang.org/x/net v0.55.0
 )
 
 require (
